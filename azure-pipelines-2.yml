@@ -1,0 +1,833 @@
+
+trigger:
+  - main
+
+pr:
+  - main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  NODE_VERSION: '22.x'
+  SOURCE_DIRECTORY: 'force-app'
+  RESULTS_DIRECTORY: '$(Build.ArtifactStagingDirectory)/Salesforce-SAST'
+  SCAN_THRESHOLD: '2'
+
+steps:
+
+# =====================================================
+# 1. CHECKOUT SOURCE CODE
+# =====================================================
+
+- checkout: self
+  displayName: 'Checkout Salesforce Source Code'
+
+# =====================================================
+# 2. INSTALL NODE.JS
+# =====================================================
+
+- task: NodeTool@0
+  displayName: 'Install Node.js 22 LTS'
+  inputs:
+    versionSpec: '$(NODE_VERSION)'
+
+# =====================================================
+# 3. INSTALL JAVA
+# =====================================================
+
+- script: |
+    set -e
+    sudo apt-get update
+    sudo apt-get install -y openjdk-17-jdk
+    java -version
+  displayName: 'Install Java 17'
+
+# =====================================================
+# 4. INSTALL SALESFORCE CLI
+# =====================================================
+
+- script: |
+    set -e
+    npm install --global @salesforce/cli@latest
+    sf --version
+  displayName: 'Install Salesforce CLI'
+
+# =====================================================
+# 5. INSTALL CODE ANALYZER V5
+# =====================================================
+
+- script: |
+    set -e
+    sf plugins install @salesforce/plugin-code-analyzer
+    sf plugins --core
+    sf code-analyzer --help
+  displayName: 'Install Salesforce Code Analyzer v5'
+
+# =====================================================
+# 6. PREPARE RESULTS DIRECTORY
+# =====================================================
+
+- script: |
+    set -e
+    mkdir -p "$(RESULTS_DIRECTORY)"
+    test -d "$(SOURCE_DIRECTORY)" || {
+      echo "ERROR: Salesforce source directory not found."
+      echo "Update SOURCE_DIRECTORY to your actual source folder."
+      exit 1
+    }
+    echo "Source directory: $(SOURCE_DIRECTORY)"
+  displayName: 'Prepare SAST Workspace'
+
+# =====================================================
+# 7. RUN SALESFORCE SAST SCAN
+# =====================================================
+
+- script: |
+    set -e
+
+    echo "============================================"
+    echo "       SALESFORCE SAST SECURITY SCAN"
+    echo "============================================"
+
+    sf code-analyzer run \
+      --workspace "$(SOURCE_DIRECTORY)" \
+      --view detail \
+      --include-fixes \
+      --include-suggestions \
+      --output-file "$(RESULTS_DIRECTORY)/code-analyzer-results.json"
+
+    echo "============================================"
+    echo "       SCAN EXECUTION COMPLETED"
+    echo "============================================"
+
+    test -s "$(RESULTS_DIRECTORY)/code-analyzer-results.json"
+
+  displayName: 'Run Salesforce SAST Scan'
+  continueOnError: false
+
+# =====================================================
+# 8. INSTALL REPORT GENERATION DEPENDENCIES
+# =====================================================
+
+- script: |
+    set -e
+
+    python3 -m venv .report-venv
+
+    .report-venv/bin/python -m pip install --upgrade pip
+
+    .report-venv/bin/python -m pip install \
+      reportlab \
+      python-docx
+
+  displayName: 'Install PDF and Word Report Dependencies'
+  condition: succeededOrFailed()
+
+# =====================================================
+# 9. GENERATE EXECUTIVE SAST ASSESSMENT
+# =====================================================
+
+- script: |
+    set -e
+
+    .report-venv/bin/python - <<'PY'
+    import json
+    import os
+    from pathlib import Path
+    from datetime import datetime, timezone
+
+    from docx import Document
+    from docx.shared import Inches, Pt, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
+
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table,
+        TableStyle, PageBreak, KeepTogether
+    )
+    from xml.sax.saxutils import escape
+
+    # -------------------------------------------------
+    # CONFIGURATION
+    # -------------------------------------------------
+
+    results_dir = Path(os.environ["RESULTS_DIRECTORY"])
+    source_dir = Path(os.environ["BUILD_SOURCESDIRECTORY"])
+    json_file = results_dir / "code-analyzer-results.json"
+
+    pdf_file = results_dir / "Salesforce_SAST_Assessment_Report.pdf"
+    docx_file = results_dir / "Salesforce_SAST_Assessment_Report.docx"
+
+    if not json_file.exists():
+        raise SystemExit("ERROR: Code Analyzer JSON results not found.")
+
+    with open(json_file, encoding="utf-8") as f:
+        data = json.load(f)
+
+    violations = data.get("violations", [])
+    counts = data.get("violationCounts", {})
+
+    severity_names = {
+        1: "Critical",
+        2: "High",
+        3: "Moderate",
+        4: "Low",
+        5: "Informational"
+    }
+
+    severity_counts = {
+        severity_names[i]: sum(
+            1 for v in violations
+            if int(v.get("severity", 5)) == i
+        )
+        for i in range(1, 6)
+    }
+
+    total = len(violations)
+    critical = severity_counts["Critical"]
+    high = severity_counts["High"]
+    moderate = severity_counts["Moderate"]
+    low = severity_counts["Low"]
+    info = severity_counts["Informational"]
+
+    now = datetime.now(timezone.utc).strftime("%d %B %Y %H:%M UTC")
+
+    project = os.environ.get("BUILD_REPOSITORY_NAME", "Salesforce Project")
+    branch = os.environ.get("BUILD_SOURCEBRANCH", "Unknown")
+    commit = os.environ.get("BUILD_SOURCEVERSION", "Unknown")[:12]
+    build_id = os.environ.get("BUILD_BUILDID", "Unknown")
+
+    run_dir = Path(data.get("runDir", str(source_dir)))
+
+    # -------------------------------------------------
+    # HELPERS
+    # -------------------------------------------------
+
+    def severity(v):
+        try:
+            return severity_names.get(int(v.get("severity", 5)), "Informational")
+        except (TypeError, ValueError):
+            return "Informational"
+
+    def primary_location(v):
+        locations = v.get("locations", [])
+        if not locations:
+            return {}
+
+        index = v.get("primaryLocationIndex", 0)
+
+        try:
+            return locations[int(index)]
+        except (ValueError, TypeError, IndexError):
+            return locations[0]
+
+    def source_excerpt(file_path, start, end):
+        candidates = [
+            run_dir / file_path,
+            source_dir / file_path
+        ]
+
+        for candidate in candidates:
+            try:
+                if candidate.is_file():
+                    lines = candidate.read_text(
+                        encoding="utf-8", errors="replace"
+                    ).splitlines()
+
+                    first = max(1, int(start or 1))
+                    last = min(len(lines), int(end or first))
+
+                    return "\n".join(
+                        f"{i}: {lines[i-1]}"
+                        for i in range(first, last + 1)
+                    )[:2500]
+            except (OSError, ValueError, TypeError):
+                pass
+
+        return "Source excerpt unavailable. Refer to the affected file and line."
+
+    def impact_for(sev):
+        impacts = {
+            "Critical": (
+                "Potentially severe security exposure. Depending on the "
+                "affected component and reachable execution path, this may "
+                "enable compromise of sensitive data, privileged operations "
+                "or critical application functionality."
+            ),
+            "High": (
+                "Potential significant security exposure. If exploitable "
+                "under the relevant application conditions, this may permit "
+                "unauthorized access, data disclosure or manipulation."
+            ),
+            "Moderate": (
+                "Potential security weakness that may contribute to "
+                "unauthorized actions, information exposure or weaknesses "
+                "in application controls."
+            ),
+            "Low": (
+                "Lower-severity weakness or insecure coding practice that "
+                "may increase attack surface or contribute to other "
+                "security weaknesses."
+            ),
+            "Informational": (
+                "Informational finding requiring engineering review. "
+                "It is not necessarily an exploitable vulnerability."
+            )
+        }
+        return impacts[sev]
+
+    def remediation_for(v):
+        rule = str(v.get("rule", ""))
+        message = str(v.get("message", ""))
+        tags = ", ".join(v.get("tags", []))
+        suggestions = v.get("suggestions", [])
+        fixes = v.get("fixes", [])
+        location = primary_location(v)
+
+        parts = [
+            "Review the indicated source code and the rule-specific "
+            "guidance before making changes.",
+            "Apply the appropriate secure coding control for the "
+            "identified rule and validate the change with unit tests "
+            "and a subsequent security scan."
+        ]
+
+        if location.get("comment"):
+            parts.append("Analyzer context: " + str(location["comment"]))
+
+        if suggestions:
+            for suggestion in suggestions:
+                if isinstance(suggestion, dict):
+                    text = suggestion.get("description") or suggestion.get("message")
+                    if text:
+                        parts.append("Analyzer suggestion: " + str(text))
+
+        if fixes:
+            parts.append(
+                "The analyzer provides fix information. Review the "
+                "available fix before applying it."
+            )
+
+        resources = v.get("resources", [])
+        for resource in resources:
+            parts.append("Rule reference: " + str(resource))
+
+        return parts
+
+    def paragraph_text(value):
+        return escape(str(value)).replace("\n", "<br/>")
+
+    # -------------------------------------------------
+    # WORD REPORT
+    # -------------------------------------------------
+
+    doc = Document()
+
+    section = doc.sections[0]
+    section.top_margin = Inches(0.65)
+    section.bottom_margin = Inches(0.65)
+    section.left_margin = Inches(0.7)
+    section.right_margin = Inches(0.7)
+
+    styles = doc.styles
+    styles["Normal"].font.name = "Arial"
+    styles["Normal"].font.size = Pt(9)
+
+    for heading in ["Heading 1", "Heading 2"]:
+        styles[heading].font.name = "Arial"
+        styles[heading].font.color.rgb = RGBColor(31, 78, 121)
+
+    title = doc.add_heading("SALESFORCE SAST ASSESSMENT REPORT", 0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    p = doc.add_paragraph("Static Application Security Testing")
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    doc.add_paragraph("")
+    doc.add_heading("Assessment Information", level=1)
+
+    metadata = [
+        ("Project", project),
+        ("Repository", os.environ.get("BUILD_REPOSITORY_URI", "Unknown")),
+        ("Branch", branch),
+        ("Commit", commit),
+        ("Pipeline Build ID", build_id),
+        ("Assessment Date", now),
+        ("Scan Engine", "Salesforce Code Analyzer v5"),
+        ("Scan Workspace", str(source_dir))
+    ]
+
+    table = doc.add_table(rows=0, cols=2)
+    table.style = "Table Grid"
+
+    for key, value in metadata:
+        cells = table.add_row().cells
+        cells[0].text = key
+        cells[1].text = str(value)
+
+    doc.add_heading("1. Executive Summary", level=1)
+
+    doc.add_paragraph(
+        f"The Salesforce source code assessment identified {total} "
+        f"security and code-quality findings. The results were generated "
+        f"using Salesforce Code Analyzer. Findings require technical "
+        f"validation to determine actual exploitability and business risk."
+    )
+
+    summary = doc.add_table(rows=1, cols=2)
+    summary.style = "Table Grid"
+    summary.rows[0].cells[0].text = "Severity"
+    summary.rows[0].cells[1].text = "Finding Count"
+
+    for name, count in severity_counts.items():
+        cells = summary.add_row().cells
+        cells[0].text = name
+        cells[1].text = str(count)
+
+    doc.add_paragraph(f"Total findings: {total}")
+
+    doc.add_heading("2. Scope and Methodology", level=1)
+
+    doc.add_paragraph(
+        "The assessment used static analysis of the configured Salesforce "
+        "source workspace. The analyzer evaluated source code against "
+        "its configured rules and available analysis engines."
+    )
+
+    doc.add_paragraph(
+        "This assessment is limited to the files and rules actually "
+        "included in the scan. It does not constitute a penetration "
+        "test, runtime security assessment, or confirmation that every "
+        "finding is exploitable."
+    )
+
+    doc.add_heading("3. Detailed Security Findings", level=1)
+
+    if not violations:
+        doc.add_paragraph(
+            "No violations were returned by Salesforce Code Analyzer "
+            "for the configured scan."
+        )
+
+    for index, v in enumerate(violations, 1):
+        loc = primary_location(v)
+        sev = severity(v)
+        file_path = loc.get("file", "Location unavailable")
+        start = loc.get("startLine", "N/A")
+        end = loc.get("endLine", start)
+        rule = v.get("rule", "Unknown rule")
+        engine = v.get("engine", "Unknown engine")
+        message = v.get("message", "No analyzer message supplied.")
+
+        doc.add_heading(
+            f"Finding {index}: {rule} [{sev}]",
+            level=2
+        )
+
+        fields = [
+            ("Severity", sev),
+            ("Rule ID", rule),
+            ("Engine", engine),
+            ("Affected File", file_path),
+            ("Affected Lines", f"{start} - {end}"),
+            ("Tags", ", ".join(v.get("tags", []))),
+            ("Description", message),
+            ("Security Impact", impact_for(sev))
+        ]
+
+        for key, value in fields:
+            p = doc.add_paragraph()
+            p.add_run(key + ": ").bold = True
+            p.add_run(str(value))
+
+        doc.add_paragraph("Affected Source Code:").runs[0].bold = True
+
+        excerpt = source_excerpt(file_path, start, end)
+
+        p = doc.add_paragraph()
+        p.paragraph_format.left_indent = Inches(0.2)
+        p.add_run(excerpt).font.name = "Courier New"
+
+        doc.add_paragraph("Recommended Remediation:").runs[0].bold = True
+
+        for item in remediation_for(v):
+            doc.add_paragraph(item, style="List Bullet")
+
+        if index != len(violations):
+            doc.add_paragraph("")
+
+    doc.add_heading("4. Remediation and Retesting", level=1)
+
+    doc.add_paragraph(
+        "Prioritize Critical and High findings, validate the affected "
+        "code paths, implement appropriate security controls, perform "
+        "regression testing, and rerun the static analysis. Findings "
+        "should only be closed after remediation evidence and retesting."
+    )
+
+    doc.add_heading("5. Assessment Conclusion", level=1)
+
+    if critical or high:
+        conclusion = (
+            "The assessment identified Critical and/or High findings. "
+            "Prioritized remediation and security review are recommended "
+            "before release."
+        )
+    elif total:
+        conclusion = (
+            "No Critical or High findings were identified in this scan. "
+            "Remaining findings should be reviewed and addressed according "
+            "to their severity and application context."
+        )
+    else:
+        conclusion = (
+            "No findings were returned by the configured static analysis "
+            "rules. This does not establish that the application is free "
+            "of security vulnerabilities."
+        )
+
+    doc.add_paragraph(conclusion)
+
+    doc.add_paragraph(
+        "Report limitation: Impact and remediation descriptions are "
+        "assessment guidance based on analyzer output and severity. "
+        "They are not a substitute for rule-specific security validation."
+    )
+
+    doc.save(docx_file)
+
+    # -------------------------------------------------
+    # PDF REPORT
+    # -------------------------------------------------
+
+    pdf_styles = getSampleStyleSheet()
+
+    pdf_styles.add(ParagraphStyle(
+        name="ReportTitle",
+        parent=pdf_styles["Title"],
+        fontName="Helvetica-Bold",
+        fontSize=19,
+        leading=24,
+        alignment=TA_CENTER,
+        textColor=colors.HexColor("#1F4E79"),
+        spaceAfter=12
+    ))
+
+    pdf_styles.add(ParagraphStyle(
+        name="SectionHeading",
+        parent=pdf_styles["Heading1"],
+        fontSize=13,
+        leading=17,
+        textColor=colors.HexColor("#1F4E79"),
+        spaceBefore=12,
+        spaceAfter=7
+    ))
+
+    pdf_styles.add(ParagraphStyle(
+        name="FindingHeading",
+        parent=pdf_styles["Heading2"],
+        fontSize=10,
+        leading=14,
+        textColor=colors.HexColor("#C65911"),
+        spaceBefore=10,
+        spaceAfter=5
+    ))
+
+    pdf_styles.add(ParagraphStyle(
+        name="ReportBody",
+        parent=pdf_styles["BodyText"],
+        fontSize=8,
+        leading=11,
+        spaceAfter=5
+    ))
+
+    pdf_styles.add(ParagraphStyle(
+        name="CodeText",
+        parent=pdf_styles["Code"],
+        fontName="Courier",
+        fontSize=6.5,
+        leading=8,
+        wordWrap="CJK",
+        leftIndent=5,
+        spaceAfter=6
+    ))
+
+    story = []
+
+    story.append(Spacer(1, 25 * mm))
+    story.append(Paragraph(
+        "SALESFORCE SAST<br/>ASSESSMENT REPORT",
+        pdf_styles["ReportTitle"]
+    ))
+    story.append(Paragraph(
+        "Static Application Security Testing",
+        pdf_styles["ReportBody"]
+    ))
+    story.append(Spacer(1, 15 * mm))
+
+    meta_data = [
+        ["Assessment Information", "Value"],
+        ["Project", project],
+        ["Branch", branch],
+        ["Commit", commit],
+        ["Pipeline Build ID", build_id],
+        ["Assessment Date", now],
+        ["Analyzer", "Salesforce Code Analyzer v5"],
+        ["Workspace", str(source_dir)]
+    ]
+
+    meta = Table(meta_data, colWidths=[50*mm, 115*mm])
+    meta.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+         [colors.white, colors.HexColor("#F2F5F8")]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6)
+    ]))
+
+    story.append(meta)
+    story.append(Spacer(1, 10))
+    story.append(Paragraph("1. Executive Summary", pdf_styles["SectionHeading"]))
+
+    story.append(Paragraph(
+        f"The assessment identified <b>{total}</b> findings across "
+        f"the configured Salesforce source workspace. Findings are "
+        f"generated by static analysis and require validation to "
+        f"establish actual exploitability and business risk.",
+        pdf_styles["ReportBody"]
+    ))
+
+    summary_data = [["Severity", "Count"]]
+
+    for name, count in severity_counts.items():
+        summary_data.append([name, str(count)])
+
+    summary = Table(summary_data, colWidths=[75*mm, 35*mm])
+    summary.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("ALIGN", (1, 0), (1, -1), "CENTER"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("PADDING", (0, 0), (-1, -1), 6)
+    ]))
+
+    story.append(summary)
+
+    story.append(Paragraph("2. Scope and Methodology", pdf_styles["SectionHeading"]))
+    story.append(Paragraph(
+        "Static analysis was performed against the configured Salesforce "
+        "source workspace using Salesforce Code Analyzer v5. Results "
+        "represent rule-based findings and do not independently prove "
+        "that a vulnerability is exploitable. The scan does not replace "
+        "dynamic testing or manual security assessment.",
+        pdf_styles["ReportBody"]
+    ))
+
+    story.append(Paragraph(
+        "3. Detailed Security Findings",
+        pdf_styles["SectionHeading"]
+    ))
+
+    if not violations:
+        story.append(Paragraph(
+            "No violations were returned by the configured scan.",
+            pdf_styles["ReportBody"]
+        ))
+
+    for index, v in enumerate(violations, 1):
+        loc = primary_location(v)
+        sev = severity(v)
+        file_path = str(loc.get("file", "Location unavailable"))
+        start = loc.get("startLine", "N/A")
+        end = loc.get("endLine", start)
+
+        rule = str(v.get("rule", "Unknown rule"))
+        engine = str(v.get("engine", "Unknown engine"))
+        message = str(v.get("message", "No analyzer message supplied."))
+
+        story.append(Paragraph(
+            f"Finding {index}: {escape(rule)} [{escape(sev)}]",
+            pdf_styles["FindingHeading"]
+        ))
+
+        finding_fields = [
+            ("Severity", sev),
+            ("Rule ID", rule),
+            ("Engine", engine),
+            ("File", file_path),
+            ("Line", f"{start} - {end}"),
+            ("Description", message),
+            ("Impact", impact_for(sev)),
+        ]
+
+        for label, value in finding_fields:
+            story.append(Paragraph(
+                f"<b>{escape(label)}:</b> {paragraph_text(value)}",
+                pdf_styles["ReportBody"]
+            ))
+
+        story.append(Paragraph(
+            "<b>Affected Source Code:</b>",
+            pdf_styles["ReportBody"]
+        ))
+
+        excerpt = source_excerpt(file_path, start, end)
+        story.append(Paragraph(
+            paragraph_text(excerpt),
+            pdf_styles["CodeText"]
+        ))
+
+        story.append(Paragraph(
+            "<b>Recommended Remediation:</b>",
+            pdf_styles["ReportBody"]
+        ))
+
+        for item in remediation_for(v):
+            story.append(Paragraph(
+                "&#8226; " + paragraph_text(item),
+                pdf_styles["ReportBody"]
+            ))
+
+    story.append(Paragraph(
+        "4. Remediation and Retesting",
+        pdf_styles["SectionHeading"]
+    ))
+
+    story.append(Paragraph(
+        "Prioritize Critical and High findings. Validate affected code "
+        "paths, implement the recommended security controls, conduct "
+        "regression testing, and rerun the scan. Close findings only "
+        "after remediation has been verified.",
+        pdf_styles["ReportBody"]
+    ))
+
+    story.append(Paragraph(
+        "5. Assessment Conclusion",
+        pdf_styles["SectionHeading"]
+    ))
+
+    story.append(Paragraph(
+        paragraph_text(conclusion),
+        pdf_styles["ReportBody"]
+    ))
+
+    story.append(Paragraph(
+        "<b>Report limitation:</b> Generic impact and remediation guidance "
+        "is not a substitute for validating the specific rule, code path, "
+        "business context and available analyzer guidance.",
+        pdf_styles["ReportBody"]
+    ))
+
+    def footer(canvas, document):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7)
+        canvas.setFillColor(colors.grey)
+        canvas.drawString(18*mm, 10*mm, "Salesforce SAST Assessment")
+        canvas.drawRightString(
+            192*mm, 10*mm, f"Page {document.page}"
+        )
+        canvas.restoreState()
+
+    pdf = SimpleDocTemplate(
+        str(pdf_file),
+        pagesize=A4,
+        rightMargin=18*mm,
+        leftMargin=18*mm,
+        topMargin=17*mm,
+        bottomMargin=18*mm,
+        title="Salesforce SAST Assessment Report",
+        author="Azure DevOps SAST Pipeline"
+    )
+
+    pdf.build(story, onFirstPage=footer, onLaterPages=footer)
+
+    print("============================================")
+    print("       REPORT GENERATION COMPLETED")
+    print("============================================")
+    print(f"Total findings: {total}")
+    print(f"Critical: {critical}")
+    print(f"High: {high}")
+    print(f"Moderate: {moderate}")
+    print(f"Low: {low}")
+    print(f"Informational: {info}")
+    print(f"PDF: {pdf_file}")
+    print(f"Word: {docx_file}")
+    print(f"JSON: {json_file}")
+
+    PY
+
+  displayName: 'Generate Detailed SAST PDF and Word Reports'
+  condition: succeededOrFailed()
+  env:
+    RESULTS_DIRECTORY: $(RESULTS_DIRECTORY)
+    BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
+    BUILD_REPOSITORY_NAME: $(Build.Repository.Name)
+    BUILD_REPOSITORY_URI: $(Build.Repository.Uri)
+    BUILD_SOURCEBRANCH: $(Build.SourceBranch)
+    BUILD_SOURCEVERSION: $(Build.SourceVersion)
+    BUILD_BUILDID: $(Build.BuildId)
+
+# =====================================================
+# 10. PUBLISH ALL RESULTS FOR LOCAL DOWNLOAD
+# =====================================================
+
+- task: PublishPipelineArtifact@1
+  displayName: 'Publish Complete Salesforce SAST Assessment'
+  condition: succeededOrFailed()
+  inputs:
+    targetPath: '$(RESULTS_DIRECTORY)'
+    artifact: 'Salesforce-SAST-Complete-Assessment'
+    publishLocation: 'pipeline'
+
+# =====================================================
+# 11. SECURITY QUALITY GATE
+# =====================================================
+
+- script: |
+    set -e
+
+    python3 - <<'PY'
+    import json
+    import os
+    from pathlib import Path
+
+    path = Path(os.environ["RESULTS_DIRECTORY"]) / "code-analyzer-results.json"
+
+    if not path.exists():
+        raise SystemExit("ERROR: Scan results are missing. Cannot evaluate quality gate.")
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    counts = data.get("violationCounts", {})
+
+    critical = int(counts.get("sev1", 0))
+    high = int(counts.get("sev2", 0))
+
+    print("===== SALESFORCE SECURITY QUALITY GATE =====")
+    print(f"Critical findings: {critical}")
+    print(f"High findings: {high}")
+
+    if critical > 0 or high > 0:
+        print("QUALITY GATE FAILED: Critical or High findings detected.")
+        raise SystemExit(1)
+
+    print("QUALITY GATE PASSED: No Critical or High findings.")
+
+    PY
+  displayName: 'Evaluate SAST Security Quality Gate'
+  condition: succeededOrFailed()
+  env:
+    RESULTS_DIRECTORY: $(RESULTS_DIRECTORY)
