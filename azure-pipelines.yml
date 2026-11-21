@@ -6,73 +6,852 @@ pr:
   - main
 
 pool:
-  vmImage: 'ubuntu-latest'
+  vmImage: ubuntu-latest
 
 variables:
-  NODE_VERSION: '22.x'
-  SOURCE_DIRECTORY: 'force-app'
+  TRIVY_VERSION: 'latest'
+  SCAN_DIRECTORY: '$(Build.SourcesDirectory)'
+  RESULTS_DIRECTORY: '$(Build.ArtifactStagingDirectory)/Trivy-SAST'
+  PYTHON_VERSION: '3.x'
 
 steps:
 
-# 1. Checkout Salesforce source code
+# =====================================================
+# 1. CHECKOUT SOURCE CODE
+# =====================================================
+
 - checkout: self
-  displayName: 'Checkout Salesforce Repository'
+  displayName: 'Checkout Source Repository'
 
-# 2. Install Node.js
-- task: NodeTool@0
-  displayName: 'Install Node.js 22 LTS'
+# =====================================================
+# 2. INSTALL PYTHON
+# =====================================================
+
+- task: UsePythonVersion@0
+  displayName: 'Install Python'
   inputs:
-    versionSpec: '$(NODE_VERSION)'
+    versionSpec: '$(PYTHON_VERSION)'
+    addToPath: true
 
-# 3. Verify environment
-- script: |
-    echo "===== Environment Details ====="
-    node --version
-    npm --version
-    java -version
-  displayName: 'Verify Build Environment'
+# =====================================================
+# 3. INSTALL TRIVY
+# =====================================================
 
-# 4. Install Salesforce CLI
-- script: |
-    set -e
-    echo "===== Installing Salesforce CLI ====="
-    npm install --global @salesforce/cli@latest
-    sf --version
-  displayName: 'Install Salesforce CLI'
-
-# 5. Install Salesforce Code Analyzer v5
-- script: |
-    set -e
-    echo "===== Installing Salesforce Code Analyzer ====="
-    sf plugins install @salesforce/plugin-code-analyzer
-    sf plugins --core
-  displayName: 'Install Salesforce Code Analyzer'
-
-# 6. Validate Salesforce Code Analyzer
-- script: |
-    set -e
-    echo "===== Validating Code Analyzer ====="
-    sf code-analyzer --help
-    sf code-analyzer rules --workspace "$(SOURCE_DIRECTORY)"
-  displayName: 'Validate Salesforce Code Analyzer'
-
-# 7. Run Salesforce Security Scan
 - script: |
     set -e
 
-    echo "=========================================="
-    echo "      SALESFORCE SECURITY SCAN"
-    echo "=========================================="
+    echo "===== Installing Trivy ====="
 
-    sf code-analyzer run \
-      --workspace "$(SOURCE_DIRECTORY)" \
-      --severity-threshold 2
+    sudo apt-get update
+    sudo apt-get install -y curl wget ca-certificates
 
-    echo "=========================================="
-    echo "      SECURITY SCAN COMPLETED"
-    echo "=========================================="
+    curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+      -o /tmp/install-trivy.sh
 
-  displayName: 'Run Salesforce Security Scan'
+    sudo sh /tmp/install-trivy.sh -b /usr/local/bin
+
+    trivy --version
+
+  displayName: 'Install Trivy Security Scanner'
+
+# =====================================================
+# 4. PREPARE SCAN WORKSPACE
+# =====================================================
+
+- script: |
+    set -e
+
+    mkdir -p "$(RESULTS_DIRECTORY)"
+
+    echo "===== Trivy Workspace ====="
+    echo "Repository: $(Build.Repository.Name)"
+    echo "Branch: $(Build.SourceBranch)"
+    echo "Commit: $(Build.SourceVersion)"
+    echo "Scan directory: $(SCAN_DIRECTORY)"
+
+  displayName: 'Prepare Trivy Scan Workspace'
+
+# =====================================================
+# 5. UPDATE TRIVY VULNERABILITY DATABASE
+# =====================================================
+
+- script: |
+    set -e
+
+    echo "===== Updating Trivy Database ====="
+
+    trivy image --download-db-only
+
+  displayName: 'Update Trivy Vulnerability Database'
+
+# =====================================================
+# 6. RUN TRIVY SECURITY SCAN
+# =====================================================
+
+- script: |
+    set -e
+
+    echo "============================================"
+    echo "          TRIVY SECURITY SCAN"
+    echo "============================================"
+
+    trivy fs \
+      --scanners vuln,misconfig,secret,license \
+      --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+      --skip-dirs .git,.venv,node_modules \
+      --skip-files "*.min.js" \
+      --format json \
+      --output "$(RESULTS_DIRECTORY)/trivy-results.json" \
+      --exit-code 0 \
+      "$(SCAN_DIRECTORY)"
+
+    test -s "$(RESULTS_DIRECTORY)/trivy-results.json"
+
+    echo "===== Trivy Scan Completed ====="
+
+  displayName: 'Run Trivy Vulnerability, Secret and IaC Scan'
   continueOnError: false
 
+# =====================================================
+# 7. DISPLAY RESULTS DIRECTLY IN PIPELINE CONSOLE
+# =====================================================
 
+- script: |
+    set -e
+
+    echo "============================================"
+    echo "         TRIVY SCAN FINDINGS"
+    echo "============================================"
+
+    trivy convert \
+      --format table \
+      "$(RESULTS_DIRECTORY)/trivy-results.json"
+
+  displayName: 'Display Trivy Findings in Pipeline Console'
+  condition: succeededOrFailed()
+
+# =====================================================
+# 8. GENERATE SARIF OUTPUT
+# =====================================================
+
+- script: |
+    set -e
+
+    trivy convert \
+      --format sarif \
+      --output "$(RESULTS_DIRECTORY)/trivy-results.sarif" \
+      "$(RESULTS_DIRECTORY)/trivy-results.json"
+
+    echo "SARIF security output generated."
+
+  displayName: 'Generate SARIF Security Findings'
+  condition: succeededOrFailed()
+
+# =====================================================
+# 9. INSTALL REPORT DEPENDENCIES
+# =====================================================
+
+- script: |
+    set -e
+
+    python3 -m venv .trivy-report-venv
+
+    .trivy-report-venv/bin/python -m pip install --upgrade pip
+
+    .trivy-report-venv/bin/python -m pip install \
+      reportlab \
+      python-docx
+
+  displayName: 'Install PDF and Word Dependencies'
+  condition: succeededOrFailed()
+
+# =====================================================
+# 10. GENERATE DETAILED PDF AND WORD REPORTS
+# =====================================================
+
+- script: |
+    set -e
+
+    .trivy-report-venv/bin/python - <<'PY'
+
+    import json
+    import os
+    from pathlib import Path
+    from datetime import datetime, timezone
+    from xml.sax.saxutils import escape
+
+    from docx import Document
+    from docx.shared import Inches, Pt, RGBColor
+
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    )
+
+    # =================================================
+    # CONFIGURATION
+    # =================================================
+
+    output = Path(os.environ["RESULTS_DIRECTORY"])
+    source = Path(os.environ["BUILD_SOURCESDIRECTORY"])
+
+    json_file = output / "trivy-results.json"
+    pdf_file = output / "Trivy_Security_Assessment_Report.pdf"
+    word_file = output / "Trivy_Security_Assessment_Report.docx"
+
+    project = os.environ.get("BUILD_REPOSITORY_NAME", "Project")
+    branch = os.environ.get("BUILD_SOURCEBRANCH", "Unknown")
+    commit = os.environ.get("BUILD_SOURCEVERSION", "Unknown")[:12]
+    build = os.environ.get("BUILD_BUILDID", "Unknown")
+
+    now = datetime.now(timezone.utc).strftime("%d %B %Y %H:%M UTC")
+
+    if not json_file.exists():
+        data = {"Results": []}
+        scan_error = True
+    else:
+        data = json.loads(json_file.read_text(encoding="utf-8"))
+        scan_error = False
+
+    results = data.get("Results") or []
+
+    severity_order = [
+        "CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"
+    ]
+
+    counts = {s: 0 for s in severity_order}
+    findings = []
+
+    # =================================================
+    # FINDING NORMALIZATION
+    # =================================================
+
+    def add_finding(category, target, item, result):
+        severity = str(item.get("Severity", "UNKNOWN")).upper()
+
+        if severity not in counts:
+            severity = "UNKNOWN"
+
+        counts[severity] += 1
+
+        loc = item.get("CauseMetadata") or {}
+        start = loc.get("StartLine")
+        end = loc.get("EndLine")
+
+        if category == "Secret":
+            start = item.get("StartLine", start)
+            end = item.get("EndLine", end)
+
+        if category == "Vulnerability":
+            file_path = item.get("PkgPath") or target
+            location = "Package-level finding; exact source line not provided by Trivy"
+        else:
+            file_path = target
+            location = (
+                f"Lines {start}-{end}" if start else
+                "Exact source line not provided by Trivy"
+            )
+
+        description = (
+            item.get("Description")
+            or item.get("Message")
+            or item.get("Title")
+            or item.get("RuleID")
+            or "No detailed description supplied by scanner."
+        )
+
+        if category == "Vulnerability":
+            remediation = (
+                f"Review package {item.get('PkgName', 'Unknown')}. "
+                f"Installed version: {item.get('InstalledVersion', 'Unknown')}. "
+                f"Fixed version: {item.get('FixedVersion') or 'No fixed version supplied'}. "
+                "Upgrade to a supported, non-vulnerable version where available, "
+                "then validate compatibility and rerun the scan."
+            )
+
+        elif category == "Misconfiguration":
+            remediation = (
+                item.get("Resolution")
+                or "Review the affected infrastructure configuration and "
+                "implement the secure configuration recommended by the "
+                "relevant Trivy check."
+            )
+
+        elif category == "Secret":
+            remediation = (
+                "Revoke or rotate the exposed credential immediately. "
+                "Remove the secret from source control and build artifacts. "
+                "Use a managed secret store or secure pipeline variable. "
+                "Review repository history and access logs for potential exposure."
+            )
+
+        else:
+            remediation = (
+                "Review the dependency license and applicable organizational "
+                "and contractual licensing requirements. Obtain legal or "
+                "compliance approval where necessary."
+            )
+
+        impact = {
+            "CRITICAL": (
+                "Potential severe security exposure requiring immediate "
+                "investigation and remediation."
+            ),
+            "HIGH": (
+                "Potential significant security exposure that could affect "
+                "confidentiality, integrity or availability."
+            ),
+            "MEDIUM": (
+                "A security weakness that may create exploitable conditions "
+                "depending on application configuration and attack paths."
+            ),
+            "LOW": (
+                "A lower-severity security or configuration weakness "
+                "requiring appropriate engineering review."
+            ),
+            "UNKNOWN": (
+                "The scanner did not provide a recognized severity. "
+                "Manual assessment is required."
+            )
+        }[severity]
+
+        findings.append({
+            "category": category,
+            "severity": severity,
+            "target": target,
+            "file": file_path,
+            "location": location,
+            "id": item.get("VulnerabilityID")
+                  or item.get("ID")
+                  or item.get("RuleID")
+                  or item.get("Category")
+                  or "Not provided",
+            "title": item.get("Title")
+                     or item.get("RuleID")
+                     or item.get("VulnerabilityID")
+                     or category,
+            "description": description,
+            "impact": impact,
+            "remediation": remediation,
+            "package": item.get("PkgName", ""),
+            "installed": item.get("InstalledVersion", ""),
+            "fixed": item.get("FixedVersion", ""),
+            "url": item.get("PrimaryURL", ""),
+            "start": start,
+            "end": end,
+            "code": item.get("Code", {}).get("Lines", [])
+        })
+
+    for result in results:
+        target = result.get("Target", "Unknown target")
+
+        for item in result.get("Vulnerabilities") or []:
+            add_finding("Vulnerability", target, item, result)
+
+        for item in result.get("Misconfigurations") or []:
+            add_finding("Misconfiguration", target, item, result)
+
+        for item in result.get("Secrets") or []:
+            add_finding("Secret", target, item, result)
+
+        for item in result.get("Licenses") or []:
+            add_finding("License", target, item, result)
+
+    # =================================================
+    # SOURCE EVIDENCE
+    # =================================================
+
+    def source_excerpt(finding):
+        if finding["code"]:
+            return "\n".join(
+                f"{x.get('Number', '')}: {x.get('Content', '')}"
+                for x in finding["code"]
+            )
+
+        if finding["category"] in ("Misconfiguration", "Secret"):
+            try:
+                candidate = source / finding["target"]
+                if candidate.is_file() and finding["start"]:
+                    lines = candidate.read_text(
+                        encoding="utf-8", errors="replace"
+                    ).splitlines()
+
+                    first = max(1, int(finding["start"]))
+                    last = min(len(lines), int(finding["end"] or first))
+
+                    return "\n".join(
+                        f"{i}: {lines[i-1]}"
+                        for i in range(first, last + 1)
+                    )
+            except (OSError, ValueError, TypeError):
+                pass
+
+        return "Source code excerpt unavailable in Trivy output."
+
+    # =================================================
+    # EXECUTIVE SUMMARY
+    # =================================================
+
+    total = len(findings)
+
+    critical = counts["CRITICAL"]
+    high = counts["HIGH"]
+
+    if scan_error:
+        conclusion = (
+            "The Trivy scan did not produce a valid results file. "
+            "No security clearance or clean-scan conclusion can be issued."
+        )
+    elif critical or high:
+        conclusion = (
+            "Critical and/or High findings were identified. "
+            "Prioritized remediation is required before release."
+        )
+    elif total:
+        conclusion = (
+            "No Critical or High findings were identified in this scan. "
+            "Remaining findings require review and risk-based remediation."
+        )
+    else:
+        conclusion = (
+            "No findings were returned by the configured Trivy scanners. "
+            "This does not establish that the application is free of "
+            "security vulnerabilities."
+        )
+
+    # =================================================
+    # WORD REPORT
+    # =================================================
+
+    doc = Document()
+    sec = doc.sections[0]
+
+    sec.top_margin = Inches(0.65)
+    sec.bottom_margin = Inches(0.65)
+    sec.left_margin = Inches(0.7)
+    sec.right_margin = Inches(0.7)
+
+    doc.styles["Normal"].font.name = "Arial"
+    doc.styles["Normal"].font.size = Pt(9)
+
+    for style in ["Heading 1", "Heading 2"]:
+        doc.styles[style].font.name = "Arial"
+        doc.styles[style].font.color.rgb = RGBColor(31, 78, 121)
+
+    title = doc.add_heading("TRIVY SECURITY ASSESSMENT REPORT", 0)
+    title.alignment = 1
+
+    doc.add_paragraph("Vulnerability, Secrets and Infrastructure Assessment")
+
+    doc.add_heading("Assessment Information", level=1)
+
+    meta = [
+        ("Project", project),
+        ("Branch", branch),
+        ("Commit", commit),
+        ("Build ID", build),
+        ("Assessment Date", now),
+        ("Scanner", "Trivy"),
+        ("Scan Scope", str(source)),
+        ("Scan Categories", "Vulnerability, Misconfiguration, Secret, License")
+    ]
+
+    table = doc.add_table(rows=0, cols=2)
+    table.style = "Table Grid"
+
+    for key, value in meta:
+        cells = table.add_row().cells
+        cells[0].text = key
+        cells[1].text = str(value)
+
+    doc.add_heading("1. Executive Summary", level=1)
+
+    doc.add_paragraph(
+        f"The Trivy assessment identified {total} findings "
+        f"across the configured repository scan."
+    )
+
+    summary = doc.add_table(rows=1, cols=2)
+    summary.style = "Table Grid"
+    summary.rows[0].cells[0].text = "Severity"
+    summary.rows[0].cells[1].text = "Count"
+
+    for sev in severity_order:
+        cells = summary.add_row().cells
+        cells[0].text = sev
+        cells[1].text = str(counts[sev])
+
+    doc.add_paragraph(f"Total findings: {total}")
+
+    doc.add_heading("2. Scope and Methodology", level=1)
+
+    doc.add_paragraph(
+        "Trivy filesystem scanning was used to inspect repository "
+        "dependencies, vulnerabilities, supported infrastructure "
+        "configurations, secrets and license findings. Results are "
+        "limited to the files, packages, databases and rules available "
+        "during the scan."
+    )
+
+    doc.add_paragraph(
+        "This is not a substitute for dynamic testing, manual penetration "
+        "testing, or a full application-specific source-code security review."
+    )
+
+    doc.add_heading("3. Detailed Findings", level=1)
+
+    if scan_error:
+        doc.add_paragraph(
+            "The scan did not produce a valid JSON results file. "
+            "Investigate the scanner execution logs."
+        )
+
+    for i, f in enumerate(findings, 1):
+        doc.add_heading(
+            f"Finding {i}: {f['title']} [{f['severity']}]",
+            level=2
+        )
+
+        details = [
+            ("Category", f["category"]),
+            ("Severity", f["severity"]),
+            ("Finding ID", f["id"]),
+            ("Affected Target", f["target"]),
+            ("Affected File / Package", f["file"]),
+            ("Source Location", f["location"]),
+            ("Description", f["description"]),
+            ("Security Impact", f["impact"]),
+            ("Remediation", f["remediation"])
+        ]
+
+        if f["package"]:
+            details.extend([
+                ("Package", f["package"]),
+                ("Installed Version", f["installed"]),
+                ("Fixed Version", f["fixed"] or "Not provided")
+            ])
+
+        if f["url"]:
+            details.append(("Reference", f["url"]))
+
+        for key, value in details:
+            p = doc.add_paragraph()
+            p.add_run(key + ": ").bold = True
+            p.add_run(str(value))
+
+        doc.add_paragraph("Source Evidence:").runs[0].bold = True
+        evidence = source_excerpt(f)
+
+        p = doc.add_paragraph()
+        p.paragraph_format.left_indent = Inches(0.2)
+        p.add_run(evidence[:5000]).font.name = "Courier New"
+
+    doc.add_heading("4. Remediation and Retesting", level=1)
+
+    doc.add_paragraph(
+        "Prioritize Critical and High findings. Rotate exposed secrets, "
+        "upgrade vulnerable dependencies, and correct insecure "
+        "infrastructure configurations. Retest the affected components "
+        "and rerun Trivy to validate remediation."
+    )
+
+    doc.add_heading("5. Assessment Conclusion", level=1)
+    doc.add_paragraph(conclusion)
+
+    doc.add_paragraph(
+        "Risk statements are severity-based guidance and do not establish "
+        "exploitability. Finding-specific business impact requires "
+        "application and infrastructure context."
+    )
+
+    doc.save(word_file)
+
+    # =================================================
+    # PDF REPORT
+    # =================================================
+
+    styles = getSampleStyleSheet()
+
+    styles.add(ParagraphStyle(
+        name="ReportTitle",
+        parent=styles["Title"],
+        fontSize=18,
+        leading=22,
+        alignment=1,
+        textColor=colors.HexColor("#1F4E79"),
+        spaceAfter=12
+    ))
+
+    styles.add(ParagraphStyle(
+        name="Section",
+        parent=styles["Heading1"],
+        fontSize=12,
+        leading=16,
+        textColor=colors.HexColor("#1F4E79"),
+        spaceBefore=12,
+        spaceAfter=7
+    ))
+
+    styles.add(ParagraphStyle(
+        name="Finding",
+        parent=styles["Heading2"],
+        fontSize=10,
+        leading=13,
+        textColor=colors.HexColor("#C65911"),
+        spaceBefore=10,
+        spaceAfter=5
+    ))
+
+    styles.add(ParagraphStyle(
+        name="BodySmall",
+        parent=styles["BodyText"],
+        fontSize=8,
+        leading=11,
+        spaceAfter=5,
+        wordWrap="CJK"
+    ))
+
+    styles.add(ParagraphStyle(
+        name="Evidence",
+        parent=styles["Code"],
+        fontSize=6.5,
+        leading=8,
+        wordWrap="CJK"
+    ))
+
+    def safe(value):
+        return escape(str(value)).replace("\n", "<br/>")
+
+    story = [
+        Spacer(1, 20*mm),
+        Paragraph("TRIVY SECURITY<br/>ASSESSMENT REPORT", styles["ReportTitle"]),
+        Paragraph(
+            "Vulnerability, Secrets and Infrastructure Assessment",
+            styles["BodySmall"]
+        ),
+        Spacer(1, 12*mm)
+    ]
+
+    metadata = [["Assessment Information", "Value"]] + [
+        [key, value] for key, value in meta
+    ]
+
+    t = Table(metadata, colWidths=[50*mm, 115*mm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("PADDING", (0, 0), (-1, -1), 6)
+    ]))
+
+    story.extend([t, Spacer(1, 10)])
+
+    story.append(Paragraph("1. Executive Summary", styles["Section"]))
+    story.append(Paragraph(safe(
+        f"The assessment identified {total} findings across the configured "
+        "repository scan."
+    ), styles["BodySmall"]))
+
+    summary_data = [["Severity", "Count"]] + [
+        [sev, str(counts[sev])] for sev in severity_order
+    ]
+
+    t = Table(summary_data, colWidths=[75*mm, 35*mm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+        ("ALIGN", (1, 0), (1, -1), "CENTER"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("PADDING", (0, 0), (-1, -1), 6)
+    ]))
+
+    story.extend([t, Spacer(1, 8)])
+
+    story.append(Paragraph("2. Scope and Methodology", styles["Section"]))
+    story.append(Paragraph(
+        "Trivy filesystem scanning examined supported dependencies, "
+        "infrastructure configurations, secrets and license findings. "
+        "Results depend on scanner coverage, available databases and "
+        "the repository contents.",
+        styles["BodySmall"]
+    ))
+
+    story.append(Paragraph("3. Detailed Findings", styles["Section"]))
+
+    if scan_error:
+        story.append(Paragraph(
+            "No valid Trivy JSON output was generated. Investigate the scan logs.",
+            styles["BodySmall"]
+        ))
+
+    for i, f in enumerate(findings, 1):
+        story.append(Paragraph(
+            f"Finding {i}: {safe(f['title'])} [{safe(f['severity'])}]",
+            styles["Finding"]
+        ))
+
+        fields = [
+            ("Category", f["category"]),
+            ("Severity", f["severity"]),
+            ("Finding ID", f["id"]),
+            ("Target", f["target"]),
+            ("File / Package", f["file"]),
+            ("Source Location", f["location"]),
+            ("Description", f["description"]),
+            ("Security Impact", f["impact"]),
+            ("Remediation", f["remediation"])
+        ]
+
+        if f["package"]:
+            fields.extend([
+                ("Package", f["package"]),
+                ("Installed Version", f["installed"]),
+                ("Fixed Version", f["fixed"] or "Not provided")
+            ])
+
+        if f["url"]:
+            fields.append(("Reference", f["url"]))
+
+        for key, value in fields:
+            story.append(Paragraph(
+                f"<b>{safe(key)}:</b> {safe(value)}",
+                styles["BodySmall"]
+            ))
+
+        story.append(Paragraph("<b>Source Evidence:</b>", styles["BodySmall"]))
+        story.append(Paragraph(
+            safe(source_excerpt(f)[:5000]),
+            styles["Evidence"]
+        ))
+
+    story.append(Paragraph("4. Remediation and Retesting", styles["Section"]))
+    story.append(Paragraph(
+        "Prioritize Critical and High findings. Rotate exposed secrets, "
+        "upgrade vulnerable dependencies and correct infrastructure "
+        "misconfigurations. Rerun the scanner to validate the changes.",
+        styles["BodySmall"]
+    ))
+
+    story.append(Paragraph("5. Assessment Conclusion", styles["Section"]))
+    story.append(Paragraph(safe(conclusion), styles["BodySmall"]))
+
+    story.append(Paragraph(
+        "Report limitation: Severity-based impact descriptions are "
+        "guidance and must be validated against the application context.",
+        styles["BodySmall"]
+    ))
+
+    def footer(canvas, document):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7)
+        canvas.setFillColor(colors.grey)
+        canvas.drawString(18*mm, 10*mm, "Trivy Security Assessment")
+        canvas.drawRightString(
+            192*mm, 10*mm, f"Page {document.page}"
+        )
+        canvas.restoreState()
+
+    pdf = SimpleDocTemplate(
+        str(pdf_file),
+        pagesize=A4,
+        rightMargin=18*mm,
+        leftMargin=18*mm,
+        topMargin=17*mm,
+        bottomMargin=18*mm
+    )
+
+    pdf.build(story, onFirstPage=footer, onLaterPages=footer)
+
+    print("===== TRIVY REPORT GENERATION COMPLETED =====")
+    print("Total findings:", total)
+    print("Severity counts:", counts)
+    print("PDF:", pdf_file)
+    print("Word:", word_file)
+    print("JSON:", json_file)
+
+    PY
+
+  displayName: 'Generate Trivy PDF and Word Assessment Reports'
+  condition: succeededOrFailed()
+  env:
+    RESULTS_DIRECTORY: $(RESULTS_DIRECTORY)
+    BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
+    BUILD_REPOSITORY_NAME: $(Build.Repository.Name)
+    BUILD_SOURCEBRANCH: $(Build.SourceBranch)
+    BUILD_SOURCEVERSION: $(Build.SourceVersion)
+    BUILD_BUILDID: $(Build.BuildId)
+
+# =====================================================
+# 11. PUBLISH COMPLETE SECURITY ASSESSMENT
+# =====================================================
+
+- task: PublishPipelineArtifact@1
+  displayName: 'Publish Complete Trivy Assessment'
+  condition: succeededOrFailed()
+  inputs:
+    targetPath: '$(RESULTS_DIRECTORY)'
+    artifact: 'Trivy-Complete-Security-Assessment'
+    publishLocation: 'pipeline'
+
+# =====================================================
+# 12. CRITICAL AND HIGH SECURITY QUALITY GATE
+# =====================================================
+
+- script: |
+    set -e
+
+    python3 - <<'PY'
+    import json
+    import os
+    import sys
+    from pathlib import Path
+
+    path = Path(os.environ["RESULTS_DIRECTORY"]) / "trivy-results.json"
+
+    if not path.exists():
+        print("QUALITY GATE FAILED: Trivy results are missing.")
+        sys.exit(1)
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+
+    critical = 0
+    high = 0
+
+    for result in data.get("Results") or []:
+        for category in (
+            "Vulnerabilities",
+            "Misconfigurations",
+            "Secrets",
+            "Licenses"
+        ):
+            for item in result.get(category) or []:
+                severity = str(item.get("Severity", "UNKNOWN")).upper()
+
+                if severity == "CRITICAL":
+                    critical += 1
+                elif severity == "HIGH":
+                    high += 1
+
+    print("============================================")
+    print("          TRIVY SECURITY QUALITY GATE")
+    print("============================================")
+    print("Critical findings:", critical)
+    print("High findings:", high)
+
+    if critical > 0 or high > 0:
+        print("QUALITY GATE FAILED")
+        sys.exit(1)
+
+    print("QUALITY GATE PASSED")
+    PY
+
+  displayName: 'Evaluate Trivy Security Quality Gate'
+  condition: succeededOrFailed()
+  env:
+    RESULTS_DIRECTORY: $(RESULTS_DIRECTORY)
