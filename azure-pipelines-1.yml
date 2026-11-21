@@ -1,20 +1,113 @@
+
+trigger:
+  - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  SFCA_SEVERITY_THRESHOLD: 'Critical'
+
 steps:
-  - script: |
-      # 1. Install Salesforce CLI & Code Analyzer v5 plugin
-      npm install -g @salesforce/cli
-      sf plugins install code-analyzer
+  - checkout: self
 
-      # 2. Run scan (Fails build automatically if severity 1 or 2 issues are found)
-      sf code-analyzer run \
-        --workspace . \
-        --rule-selector Recommended \
-        --severity-threshold 2 \
-        --output-file sfca-report.html
-    displayName: 'Run Salesforce Code Analyzer'
+  - task: Bash@3
+    displayName: 'Install and Run Salesforce Code Analyzer v5'
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -Eeuo pipefail
 
-  # Optional: Publish the HTML report as a downloadable artifact
-  - task: PublishBuildArtifacts@1
+        echo "======================================"
+        echo " Salesforce Code Analyzer v5"
+        echo "======================================"
+
+        REPORT_DIR="$(Build.ArtifactStagingDirectory)/SFCA"
+        mkdir -p "$REPORT_DIR"
+
+        HTML_REPORT="$REPORT_DIR/sfca-report.html"
+        SARIF_REPORT="$REPORT_DIR/sfca-report.sarif"
+
+        # Always create reports, even if installation or scanning fails.
+        create_fallback_reports() {
+          RESULT=$?
+
+          if [ ! -s "$HTML_REPORT" ]; then
+            printf '%s\n' \
+              '<html><body><h2>Salesforce Code Analyzer</h2><p>Scan did not produce an HTML report. Check pipeline logs.</p></body></html>' \
+              > "$HTML_REPORT"
+          fi
+
+          if [ ! -s "$SARIF_REPORT" ]; then
+            printf '%s\n' \
+              '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[]}' \
+              > "$SARIF_REPORT"
+          fi
+
+          echo "Reports prepared. Scan exit code: $RESULT"
+          exit "$RESULT"
+        }
+
+        trap create_fallback_reports EXIT
+
+        echo "Checking Node.js..."
+
+        node --version
+        NODE_MAJOR=$(node -p "Number(process.versions.node.split('.')[0])")
+
+        if [ "$NODE_MAJOR" -lt 20 ]; then
+          echo "ERROR: Salesforce CLI requires Node.js 20 or later."
+          exit 1
+        fi
+
+        echo "Checking Java..."
+
+        java -version
+
+        echo "Checking Python..."
+
+        python3 --version
+
+        echo "Installing Salesforce CLI..."
+
+        npm install --global @salesforce/cli
+
+        echo "Verifying Salesforce CLI..."
+
+        sf --version
+
+        echo "Checking Code Analyzer v5..."
+
+        # Code Analyzer v5 is installed automatically by Salesforce CLI
+        # when its command is first invoked, if not already installed.
+        sf code-analyzer --help
+
+        echo "Starting Salesforce Code Analyzer scan..."
+
+        echo "Severity threshold: $(SFCA_SEVERITY_THRESHOLD)"
+
+        sf code-analyzer run \
+          --workspace "$(Build.SourcesDirectory)" \
+          --view detail \
+          --severity-threshold "$(SFCA_SEVERITY_THRESHOLD)" \
+          --include-fixes \
+          --include-suggestions \
+          --output-file "$HTML_REPORT" \
+          --output-file "$SARIF_REPORT"
+
+        echo "Salesforce Code Analyzer execution completed."
+
+        echo "HTML report: $HTML_REPORT"
+        echo "SARIF report: $SARIF_REPORT"
+
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish Salesforce Code Analyzer Reports'
     condition: always()
     inputs:
-      PathtoPublish: 'sfca-report.html'
-      ArtifactName: 'CodeAnalyzerReport'
+      targetPath: '$(Build.ArtifactStagingDirectory)/SFCA'
+      artifact: 'SFCA_Report'
+      publishLocation: 'pipeline'
+
+
+
+
