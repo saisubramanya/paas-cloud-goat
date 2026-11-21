@@ -1,0 +1,826 @@
+
+trigger:
+  branches:
+    include:
+      - main
+      - master
+      - develop
+
+pr:
+  branches:
+    include:
+      - main
+      - master
+      - develop
+
+pool:
+  name: 'Default'
+
+variables:
+  # Set this to the actual Fortify SCA installation directory on the agent.
+  FORTIFY_HOME: '/opt/fortify'
+
+  # Unique Fortify build ID for this pipeline run.
+  FORTIFY_BUILD_ID: 'AzureDevOps-$(Build.BuildId)'
+
+  # Application build command used during Fortify translation.
+  # This example assumes a Maven project.
+  FORTIFY_BUILD_COMMAND: 'mvn -B clean package -DskipTests'
+
+  # Set to 1 to fail the pipeline when Critical or High findings exist.
+  FORTIFY_FAIL_ON_HIGH: '1'
+
+  # Set to 1 to include suppressed findings in the exported issue list.
+  FORTIFY_INCLUDE_SUPPRESSED: '0'
+
+  RESULTS_DIRECTORY: '$(Build.ArtifactStagingDirectory)/Fortify-Results'
+
+  # Report metadata.
+  CLIENT_NAME: '{Client}'
+  APPLICATION_NAME: 'Application Security Assessment'
+
+stages:
+- stage: Fortify_SAST
+  displayName: 'Fortify Static Code Analysis'
+
+  jobs:
+  - job: Fortify_Scan
+    displayName: 'Fortify SCA Scan and Reporting'
+
+    steps:
+
+    # ---------------------------------------------------------
+    # STEP 1: CHECKOUT SOURCE CODE
+    # ---------------------------------------------------------
+    - checkout: self
+      clean: true
+      displayName: 'Checkout Source Code'
+
+    # ---------------------------------------------------------
+    # STEP 2: VERIFY FORTIFY INSTALLATION
+    # ---------------------------------------------------------
+    - task: Bash@3
+      displayName: 'Verify Fortify SCA Installation'
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+
+          echo "=========================================="
+          echo "FORTIFY SCA ENVIRONMENT VALIDATION"
+          echo "=========================================="
+
+          if [ ! -d "$FORTIFY_HOME" ]; then
+            echo "ERROR: Fortify installation directory not found."
+            echo "Configured FORTIFY_HOME: $FORTIFY_HOME"
+            exit 1
+          fi
+
+          export PATH="$FORTIFY_HOME/bin:$PATH"
+
+          for tool in sourceanalyzer ReportGenerator FPRUtility; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "ERROR: Required Fortify executable not found: $tool"
+              exit 1
+            fi
+            echo "Found: $tool"
+          done
+
+          echo ""
+          echo "Fortify version:"
+          sourceanalyzer -version
+
+          echo ""
+          echo "Fortify installation validation completed."
+      env:
+        FORTIFY_HOME: $(FORTIFY_HOME)
+
+    # ---------------------------------------------------------
+    # STEP 3: CREATE RESULTS DIRECTORY
+    # ---------------------------------------------------------
+    - task: Bash@3
+      displayName: 'Prepare Fortify Results Directory'
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+
+          mkdir -p "$RESULTS_DIRECTORY"
+
+          echo "Results directory:"
+          echo "$RESULTS_DIRECTORY"
+
+          echo "Repository directory:"
+          echo "$BUILD_SOURCESDIRECTORY"
+
+          echo "Build ID:"
+          echo "$FORTIFY_BUILD_ID"
+      env:
+        RESULTS_DIRECTORY: $(RESULTS_DIRECTORY)
+        BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
+        FORTIFY_BUILD_ID: $(FORTIFY_BUILD_ID)
+
+    # ---------------------------------------------------------
+    # STEP 4: CLEAN PREVIOUS FORTIFY BUILD DATA
+    # ---------------------------------------------------------
+    - task: Bash@3
+      displayName: 'Clean Previous Fortify Build Data'
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+
+          export PATH="$FORTIFY_HOME/bin:$PATH"
+
+          echo "Cleaning Fortify build ID:"
+          echo "$FORTIFY_BUILD_ID"
+
+          sourceanalyzer -b "$FORTIFY_BUILD_ID" -clean
+
+          echo "Fortify build data cleaned successfully."
+      env:
+        FORTIFY_HOME: $(FORTIFY_HOME)
+        FORTIFY_BUILD_ID: $(FORTIFY_BUILD_ID)
+
+    # ---------------------------------------------------------
+    # STEP 5: BUILD AND TRANSLATE APPLICATION
+    # ---------------------------------------------------------
+    - task: Bash@3
+      displayName: 'Build and Translate Source Code'
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+
+          export PATH="$FORTIFY_HOME/bin:$PATH"
+
+          cd "$BUILD_SOURCESDIRECTORY"
+
+          echo "=========================================="
+          echo "FORTIFY TRANSLATION PHASE"
+          echo "=========================================="
+
+          echo "Build ID: $FORTIFY_BUILD_ID"
+          echo "Build command: $FORTIFY_BUILD_COMMAND"
+
+          # Fortify wraps the actual application build command.
+          # This example is configured for Maven.
+          sourceanalyzer \
+            -b "$FORTIFY_BUILD_ID" \
+            mvn -B clean package -DskipTests
+
+          echo ""
+          echo "Translation phase completed."
+
+          echo ""
+          echo "Fortify translation warnings:"
+          sourceanalyzer \
+            -b "$FORTIFY_BUILD_ID" \
+            -show-build-warnings || true
+
+          echo ""
+          echo "Translated source files:"
+          sourceanalyzer \
+            -b "$FORTIFY_BUILD_ID" \
+            -show-files \
+            > "$RESULTS_DIRECTORY/fortify-translated-files.txt"
+
+          cat "$RESULTS_DIRECTORY/fortify-translated-files.txt"
+      env:
+        FORTIFY_HOME: $(FORTIFY_HOME)
+        FORTIFY_BUILD_ID: $(FORTIFY_BUILD_ID)
+        FORTIFY_BUILD_COMMAND: $(FORTIFY_BUILD_COMMAND)
+        BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
+        RESULTS_DIRECTORY: $(RESULTS_DIRECTORY)
+
+    # ---------------------------------------------------------
+    # STEP 6: RUN FORTIFY STATIC ANALYSIS
+    # ---------------------------------------------------------
+    - task: Bash@3
+      displayName: 'Run Fortify Static Code Analysis'
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+
+          export PATH="$FORTIFY_HOME/bin:$PATH"
+
+          echo "=========================================="
+          echo "FORTIFY SECURITY ANALYSIS"
+          echo "=========================================="
+
+          sourceanalyzer \
+            -b "$FORTIFY_BUILD_ID" \
+            -scan \
+            -f "$RESULTS_DIRECTORY/fortify-results.fpr"
+
+          if [ ! -s "$RESULTS_DIRECTORY/fortify-results.fpr" ]; then
+            echo "ERROR: Fortify FPR result file was not generated."
+            exit 1
+          fi
+
+          echo ""
+          echo "Fortify scan completed successfully."
+          echo "FPR file:"
+          ls -lh "$RESULTS_DIRECTORY/fortify-results.fpr"
+      env:
+        FORTIFY_HOME: $(FORTIFY_HOME)
+        FORTIFY_BUILD_ID: $(FORTIFY_BUILD_ID)
+        RESULTS_DIRECTORY: $(RESULTS_DIRECTORY)
+
+    # ---------------------------------------------------------
+    # STEP 7: EXPORT FORTIFY ISSUE DETAILS TO CSV
+    # ---------------------------------------------------------
+    - task: Bash@3
+      displayName: 'Export Fortify Findings to CSV'
+      condition: succeededOrFailed()
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+
+          export PATH="$FORTIFY_HOME/bin:$PATH"
+
+          FPR_FILE="$RESULTS_DIRECTORY/fortify-results.fpr"
+
+          if [ ! -s "$FPR_FILE" ]; then
+            echo "FPR file unavailable. Cannot export findings."
+            exit 1
+          fi
+
+          echo "Exporting Fortify findings..."
+
+          if [ "$FORTIFY_INCLUDE_SUPPRESSED" = "1" ]; then
+            SUPPRESSED_OPTION="-includeSuppressed"
+          else
+            SUPPRESSED_OPTION=""
+          fi
+
+          # Export unsuppressed findings by default.
+          # The FPRUtility command supports CSV issue exports.
+          if [ "$FORTIFY_INCLUDE_SUPPRESSED" = "1" ]; then
+            FPRUtility \
+              -information \
+              -listIssuesWithMetadata \
+              -search \
+              -queryAll \
+              -includeSuppressed \
+              -project "$FPR_FILE" \
+              -f "$RESULTS_DIRECTORY/fortify-findings.csv" \
+              -outputFormat CSV
+          else
+            FPRUtility \
+              -information \
+              -listIssuesWithMetadata \
+              -search \
+              -queryAllExistingUnsuppressed \
+              -project "$FPR_FILE" \
+              -f "$RESULTS_DIRECTORY/fortify-findings.csv" \
+              -outputFormat CSV
+          fi
+
+          if [ ! -s "$RESULTS_DIRECTORY/fortify-findings.csv" ]; then
+            echo "ERROR: Fortify CSV export is empty or missing."
+            exit 1
+          fi
+
+          echo ""
+          echo "Fortify findings exported."
+          echo "CSV output:"
+          cat "$RESULTS_DIRECTORY/fortify-findings.csv"
+      env:
+        FORTIFY_HOME: $(FORTIFY_HOME)
+        RESULTS_DIRECTORY: $(RESULTS_DIRECTORY)
+        FORTIFY_INCLUDE_SUPPRESSED: $(FORTIFY_INCLUDE_SUPPRESSED)
+
+    # ---------------------------------------------------------
+    # STEP 8: GENERATE FORTIFY CATEGORY COUNTS
+    # ---------------------------------------------------------
+    - task: Bash@3
+      displayName: 'Generate Fortify Vulnerability Summary'
+      condition: succeededOrFailed()
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+
+          export PATH="$FORTIFY_HOME/bin:$PATH"
+
+          FPR_FILE="$RESULTS_DIRECTORY/fortify-results.fpr"
+
+          if [ ! -s "$FPR_FILE" ]; then
+            echo "FPR file unavailable. Skipping category summary."
+            exit 1
+          fi
+
+          echo "=========================================="
+          echo "FORTIFY VULNERABILITY CATEGORY COUNTS"
+          echo "=========================================="
+
+          FPRUtility \
+            -information \
+            -categoryIssueCounts \
+            -project "$FPR_FILE" \
+            | tee "$RESULTS_DIRECTORY/fortify-category-counts.txt"
+
+          echo ""
+          echo "=========================================="
+          echo "FORTIFY ANALYZER COUNTS"
+          echo "=========================================="
+
+          FPRUtility \
+            -information \
+            -analyzerIssueCounts \
+            -project "$FPR_FILE" \
+            | tee "$RESULTS_DIRECTORY/fortify-analyzer-counts.txt"
+      env:
+        FORTIFY_HOME: $(FORTIFY_HOME)
+        RESULTS_DIRECTORY: $(RESULTS_DIRECTORY)
+
+    # ---------------------------------------------------------
+    # STEP 9: GENERATE NATIVE FORTIFY PDF REPORT
+    # ---------------------------------------------------------
+    - task: Bash@3
+      displayName: 'Generate Fortify PDF Report'
+      condition: succeededOrFailed()
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+
+          export PATH="$FORTIFY_HOME/bin:$PATH"
+
+          FPR_FILE="$RESULTS_DIRECTORY/fortify-results.fpr"
+
+          if [ ! -s "$FPR_FILE" ]; then
+            echo "FPR file unavailable. Cannot generate PDF report."
+            exit 1
+          fi
+
+          ReportGenerator \
+            -source "$FPR_FILE" \
+            -format pdf \
+            -f "$RESULTS_DIRECTORY/Fortify_Security_Assessment_Report.pdf" \
+            -verbose
+
+          if [ ! -s "$RESULTS_DIRECTORY/Fortify_Security_Assessment_Report.pdf" ]; then
+            echo "ERROR: Fortify PDF report was not generated."
+            exit 1
+          fi
+
+          echo "Fortify PDF report generated successfully."
+          ls -lh "$RESULTS_DIRECTORY/Fortify_Security_Assessment_Report.pdf"
+      env:
+        FORTIFY_HOME: $(FORTIFY_HOME)
+        RESULTS_DIRECTORY: $(RESULTS_DIRECTORY)
+
+    # ---------------------------------------------------------
+    # STEP 10: GENERATE FORTIFY XML REPORT
+    # ---------------------------------------------------------
+    - task: Bash@3
+      displayName: 'Generate Fortify XML Report'
+      condition: succeededOrFailed()
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+
+          export PATH="$FORTIFY_HOME/bin:$PATH"
+
+          FPR_FILE="$RESULTS_DIRECTORY/fortify-results.fpr"
+
+          if [ ! -s "$FPR_FILE" ]; then
+            echo "FPR file unavailable. Cannot generate XML report."
+            exit 1
+          fi
+
+          ReportGenerator \
+            -source "$FPR_FILE" \
+            -format xml \
+            -f "$RESULTS_DIRECTORY/fortify-results.xml" \
+            -verbose
+
+          if [ ! -s "$RESULTS_DIRECTORY/fortify-results.xml" ]; then
+            echo "ERROR: Fortify XML report was not generated."
+            exit 1
+          fi
+
+          echo "Fortify XML report generated successfully."
+      env:
+        FORTIFY_HOME: $(FORTIFY_HOME)
+        RESULTS_DIRECTORY: $(RESULTS_DIRECTORY)
+
+    # ---------------------------------------------------------
+    # STEP 11: INSTALL REPORTING DEPENDENCIES
+    # ---------------------------------------------------------
+    - task: Bash@3
+      displayName: 'Install Python Reporting Dependencies'
+      condition: succeededOrFailed()
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+
+          python3 --version
+
+          python3 -m venv "$RESULTS_DIRECTORY/report-venv"
+
+          "$RESULTS_DIRECTORY/report-venv/bin/python" -m pip install --upgrade pip
+
+          "$RESULTS_DIRECTORY/report-venv/bin/python" -m pip install \
+            python-docx \
+            reportlab
+
+          echo "Reporting dependencies installed."
+      env:
+        RESULTS_DIRECTORY: $(RESULTS_DIRECTORY)
+
+    # ---------------------------------------------------------
+    # STEP 12: GENERATE DETAILED DOCX ASSESSMENT REPORT
+    # ---------------------------------------------------------
+    - task: Bash@3
+      displayName: 'Generate Detailed Fortify DOCX Report'
+      condition: succeededOrFailed()
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+
+          CSV_FILE="$RESULTS_DIRECTORY/fortify-findings.csv"
+          DOCX_FILE="$RESULTS_DIRECTORY/Fortify_Detailed_Security_Assessment.docx"
+          VENV_PYTHON="$RESULTS_DIRECTORY/report-venv/bin/python"
+
+          if [ ! -s "$CSV_FILE" ]; then
+            echo "ERROR: Findings CSV is missing."
+            exit 1
+          fi
+
+          if [ ! -x "$VENV_PYTHON" ]; then
+            echo "ERROR: Reporting Python environment is missing."
+            exit 1
+          fi
+
+          "$VENV_PYTHON" - "$CSV_FILE" "$DOCX_FILE" \
+            "$CLIENT_NAME" "$APPLICATION_NAME" "$BUILD_BUILDNUMBER" <<'PYTHON'
+          import csv
+          import sys
+          from datetime import datetime, timezone
+          from docx import Document
+          from docx.shared import Inches, Pt, RGBColor
+          from docx.enum.text import WD_ALIGN_PARAGRAPH
+          from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
+
+          csv_file, output_file, client, application, build_number = sys.argv[1:]
+
+          def clean(value):
+              return str(value or "").strip().strip('"')
+
+          with open(csv_file, newline="", encoding="utf-8-sig", errors="replace") as handle:
+              rows = list(csv.reader(handle))
+
+          # FPRUtility CSV output contains issue metadata. The documented
+          # metadata sequence includes instance ID, category, audience,
+          # confidence, Fortify priority, likelihood, impact, probability,
+          # accuracy, location and analyzer.
+          findings = []
+          for row in rows:
+              if not row or len(row) < 5:
+                  continue
+              if clean(row[0]).lower() in ("instanceid", "instance id"):
+                  continue
+              if not clean(row[0]):
+                  continue
+              findings.append(row)
+
+          def priority(row):
+              # Fortify priority (friority) is column 5 in the documented
+              # metadata CSV layout. Preserve the raw value if it differs.
+              return clean(row[4]) if len(row) > 4 else "Unknown"
+
+          def priority_group(value):
+              value = value.strip().lower()
+              mapping = {
+                  "1": "Critical",
+                  "2": "High",
+                  "3": "Medium",
+                  "4": "Low",
+                  "5": "Informational",
+                  "critical": "Critical",
+                  "high": "High",
+                  "medium": "Medium",
+                  "low": "Low",
+                  "informational": "Informational",
+                  "info": "Informational"
+              }
+              return mapping.get(value, "Unknown")
+
+          counts = {
+              "Critical": 0,
+              "High": 0,
+              "Medium": 0,
+              "Low": 0,
+              "Informational": 0,
+              "Unknown": 0
+          }
+
+          for row in findings:
+              counts[priority_group(priority(row))] += 1
+
+          doc = Document()
+          section = doc.sections[0]
+          section.top_margin = Inches(0.65)
+          section.bottom_margin = Inches(0.65)
+          section.left_margin = Inches(0.7)
+          section.right_margin = Inches(0.7)
+
+          styles = doc.styles
+          styles["Normal"].font.name = "Arial"
+          styles["Normal"].font.size = Pt(9)
+          styles["Normal"].font.color.rgb = RGBColor(0, 0, 0)
+
+          for style_name in ("Heading 1", "Heading 2", "Heading 3"):
+              styles[style_name].font.name = "Arial"
+
+          styles["Heading 1"].font.size = Pt(11)
+          styles["Heading 1"].font.bold = True
+          styles["Heading 1"].font.color.rgb = RGBColor(31, 78, 121)
+
+          styles["Heading 2"].font.size = Pt(9)
+          styles["Heading 2"].font.bold = True
+          styles["Heading 2"].font.color.rgb = RGBColor(230, 126, 34)
+
+          title = doc.add_heading("Fortify Static Code Analysis Report", 0)
+          title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+          subtitle = doc.add_paragraph("Source Code Security Assessment")
+          subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+          doc.add_paragraph(f"Client: {client}")
+          doc.add_paragraph(f"Application: {application}")
+          doc.add_paragraph(f"Azure DevOps Build: {build_number}")
+          doc.add_paragraph(
+              "Report generated (UTC): " +
+              datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+          )
+          doc.add_paragraph("Scanner: OpenText Fortify Static Code Analyzer")
+
+          doc.add_heading("1. Executive Summary", level=1)
+          doc.add_paragraph(
+              f"The Fortify SCA pipeline generated {len(findings)} active "
+              "issue records in the exported findings file. Findings are "
+              "summarized using the Fortify priority metadata exported from "
+              "the FPR. Review and validate each issue before remediation "
+              "or formal risk acceptance."
+          )
+
+          doc.add_heading("2. Assessment Summary", level=1)
+          table = doc.add_table(rows=1, cols=2)
+          table.style = "Table Grid"
+          table.alignment = WD_TABLE_ALIGNMENT.CENTER
+          table.rows[0].cells[0].text = "Priority"
+          table.rows[0].cells[1].text = "Finding Count"
+
+          for name, count in counts.items():
+              cells = table.add_row().cells
+              cells[0].text = name
+              cells[1].text = str(count)
+
+          cells = table.add_row().cells
+          cells[0].text = "Total"
+          cells[1].text = str(len(findings))
+
+          doc.add_heading("3. Scope and Methodology", level=1)
+          doc.add_paragraph(
+              "The assessment was performed against the source code checked "
+              "out by the Azure DevOps pipeline. Fortify translation was "
+              "performed using the configured application build command, "
+              "followed by static analysis and FPR generation."
+          )
+          doc.add_paragraph(
+              "This report reflects the findings exported from the generated "
+              "Fortify FPR. It does not independently establish exploitability."
+          )
+
+          doc.add_heading("4. Detailed Findings", level=1)
+
+          if not findings:
+              doc.add_paragraph(
+                  "No active issue records were present in the exported CSV. "
+                  "Confirm the scan completed successfully and review the FPR "
+                  "and Fortify report before concluding that no issues exist."
+              )
+
+          for number, row in enumerate(findings, start=1):
+              category = clean(row[1]) if len(row) > 1 else "Not supplied"
+              audience = clean(row[2]) if len(row) > 2 else "Not supplied"
+              confidence = clean(row[3]) if len(row) > 3 else "Not supplied"
+              fortify_priority = priority(row)
+              location = clean(row[9]) if len(row) > 9 else "Not supplied"
+              analyzer = clean(row[10]) if len(row) > 10 else "Not supplied"
+
+              doc.add_heading(f"Finding {number}: {category}", level=2)
+              doc.add_paragraph(f"Fortify Priority: {fortify_priority}")
+              doc.add_paragraph(f"Location: {location}")
+              doc.add_paragraph(f"Analyzer: {analyzer}")
+              doc.add_paragraph(f"Audience: {audience}")
+              doc.add_paragraph(f"Confidence: {confidence}")
+              doc.add_paragraph(
+                  "Description: Refer to the corresponding issue details, "
+                  "rule description and trace in the Fortify PDF/XML report."
+              )
+              doc.add_paragraph(
+                  "Potential Impact: Impact depends on the vulnerability "
+                  "category, affected code path, application context and "
+                  "whether the reported source-to-sink path is reachable."
+              )
+              doc.add_paragraph(
+                  "Recommended Action: Review the Fortify trace and rule "
+                  "guidance, validate the data flow, implement the appropriate "
+                  "secure coding correction, and rescan to verify remediation."
+              )
+
+          doc.add_heading("5. Remediation and Retesting", level=1)
+          doc.add_paragraph(
+              "Prioritize Critical and High findings for prompt triage. Assign "
+              "an owner and target date to validated findings. After fixes are "
+              "merged, rerun Fortify SCA and compare the new FPR against the "
+              "previous assessment. Document accepted risks and false-positive "
+              "decisions through the organization's formal review process."
+          )
+
+          doc.add_heading("6. Limitations", level=1)
+          doc.add_paragraph(
+              "Static analysis can produce false positives and false "
+              "negatives. Results depend on translation completeness, build "
+              "configuration, supported languages, rulepack version and scan "
+              "configuration. Manual validation and complementary security "
+              "testing may be required."
+          )
+
+          doc.add_heading("7. Conclusion", level=1)
+          doc.add_paragraph(
+              f"The scan exported {len(findings)} issue records. Refer to the "
+              "attached native Fortify PDF, XML, CSV and FPR files for the "
+              "underlying scan evidence and issue details."
+          )
+
+          doc.save(output_file)
+          print(f"DOCX report generated: {output_file}")
+          print(f"Exported issue rows: {len(findings)}")
+          print(f"Priority counts: {counts}")
+          PYTHON
+
+          test -s "$DOCX_FILE"
+          echo "DOCX report generated successfully."
+          ls -lh "$DOCX_FILE"
+      env:
+        RESULTS_DIRECTORY: $(RESULTS_DIRECTORY)
+        CLIENT_NAME: $(CLIENT_NAME)
+        APPLICATION_NAME: $(APPLICATION_NAME)
+        BUILD_BUILDNUMBER: $(Build.BuildNumber)
+
+    # ---------------------------------------------------------
+    # STEP 13: GENERATE SCAN METADATA AND ERROR REPORT
+    # ---------------------------------------------------------
+    - task: Bash@3
+      displayName: 'Generate Fortify Scan Metadata'
+      condition: succeededOrFailed()
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+
+          export PATH="$FORTIFY_HOME/bin:$PATH"
+
+          FPR_FILE="$RESULTS_DIRECTORY/fortify-results.fpr"
+
+          if [ ! -s "$FPR_FILE" ]; then
+            echo "FPR file unavailable. Skipping metadata."
+            exit 1
+          fi
+
+          FPRUtility \
+            -information \
+            -versions \
+            -project "$FPR_FILE" \
+            > "$RESULTS_DIRECTORY/fortify-versions.txt"
+
+          FPRUtility \
+            -information \
+            -errors \
+            -project "$FPR_FILE" \
+            -f "$RESULTS_DIRECTORY/fortify-analysis-errors.txt"
+
+          echo "Fortify metadata and analysis error report generated."
+      env:
+        FORTIFY_HOME: $(FORTIFY_HOME)
+        RESULTS_DIRECTORY: $(RESULTS_DIRECTORY)
+
+    # ---------------------------------------------------------
+    # STEP 14: PUBLISH ALL RESULTS BEFORE QUALITY GATE
+    # ---------------------------------------------------------
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Fortify Security Assessment Artifacts'
+      condition: succeededOrFailed()
+      inputs:
+        PathtoPublish: '$(RESULTS_DIRECTORY)'
+        ArtifactName: 'Fortify-Complete-Security-Assessment'
+        publishLocation: 'Container'
+
+    # ---------------------------------------------------------
+    # STEP 15: CRITICAL AND HIGH SECURITY QUALITY GATE
+    # ---------------------------------------------------------
+    - task: Bash@3
+      displayName: 'Fortify Critical and High Security Quality Gate'
+      condition: succeededOrFailed()
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+
+          CSV_FILE="$RESULTS_DIRECTORY/fortify-findings.csv"
+
+          if [ "$FORTIFY_FAIL_ON_HIGH" != "1" ]; then
+            echo "Fortify quality gate is disabled."
+            exit 0
+          fi
+
+          if [ ! -s "$CSV_FILE" ]; then
+            echo "ERROR: Fortify findings CSV is unavailable."
+            echo "Cannot evaluate the security quality gate."
+            exit 1
+          fi
+
+          python3 - "$CSV_FILE" <<'PYTHON'
+          import csv
+          import sys
+
+          csv_file = sys.argv[1]
+
+          critical = 0
+          high = 0
+          medium = 0
+          low = 0
+          informational = 0
+          unknown = 0
+
+          mapping = {
+              "1": "critical",
+              "2": "high",
+              "3": "medium",
+              "4": "low",
+              "5": "informational",
+              "critical": "critical",
+              "high": "high",
+              "medium": "medium",
+              "low": "low",
+              "informational": "informational",
+              "info": "informational"
+          }
+
+          with open(csv_file, newline="", encoding="utf-8-sig", errors="replace") as f:
+              for row in csv.reader(f):
+                  if len(row) < 5:
+                      continue
+
+                  if row[0].strip().lower() in ("instanceid", "instance id"):
+                      continue
+
+                  value = row[4].strip().strip('"').lower()
+                  level = mapping.get(value, "unknown")
+
+                  if level == "critical":
+                      critical += 1
+                  elif level == "high":
+                      high += 1
+                  elif level == "medium":
+                      medium += 1
+                  elif level == "low":
+                      low += 1
+                  elif level == "informational":
+                      informational += 1
+                  else:
+                      unknown += 1
+
+          print("====================================")
+          print("FORTIFY SECURITY QUALITY GATE")
+          print("====================================")
+          print(f"Critical: {critical}")
+          print(f"High: {high}")
+          print(f"Medium: {medium}")
+          print(f"Low: {low}")
+          print(f"Informational: {informational}")
+          print(f"Unknown: {unknown}")
+          print("====================================")
+
+          if critical > 0 or high > 0:
+              print("QUALITY GATE FAILED.")
+              print("Critical or High Fortify priority findings detected.")
+              sys.exit(1)
+
+          print("QUALITY GATE PASSED.")
+          print("No Critical or High Fortify priority findings detected.")
+          PYTHON
+      env:
+        RESULTS_DIRECTORY: $(RESULTS_DIRECTORY)
+        FORTIFY_FAIL_ON_HIGH: $(FORTIFY_FAIL_ON_HIGH)
