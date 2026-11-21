@@ -1,33 +1,78 @@
+
 trigger:
   - main
-  - develop
+
+pr:
+  - main
 
 pool:
   vmImage: 'ubuntu-latest'
 
+variables:
+  NODE_VERSION: '22.x'
+  SOURCE_DIRECTORY: 'force-app'
+
 steps:
-  - task: NodeTool@0
-    inputs:
-      versionSpec: '18.x'
-    displayName: 'Install Node.js'
 
-  - script: |
-      npm install -g @salesforce/cli
-    displayName: 'Install Salesforce CLI'
+# 1. Checkout Salesforce source code
+- checkout: self
+  displayName: 'Checkout Salesforce Repository'
 
-  - script: |
-      sf plugins install @salesforce/sfdx-scanner
-    displayName: 'Install Salesforce Code Analyzer'
+# 2. Install Node.js
+- task: NodeTool@0
+  displayName: 'Install Node.js 22 LTS'
+  inputs:
+    versionSpec: '$(NODE_VERSION)'
 
-  - script: |
-      sf scanner run --target "force-app" --format "junit" --outfile "scanner-results.xml" --severity-threshold 3
-    displayName: 'Run Code Analyzer Scan'
-    continueOnError: true
+# 3. Verify environment
+- script: |
+    echo "===== Environment Details ====="
+    node --version
+    npm --version
+    java -version
+  displayName: 'Verify Build Environment'
 
-  - task: PublishTestResults@2
-    inputs:
-      testResultsFormat: 'JUnit'
-      testResultsFiles: 'scanner-results.xml'
-      title: 'Salesforce Code Analyzer Results'
-    displayName: 'Publish Scan Results'
+# 4. Install Salesforce CLI
+- script: |
+    set -e
+    echo "===== Installing Salesforce CLI ====="
+    npm install --global @salesforce/cli@latest
+    sf --version
+  displayName: 'Install Salesforce CLI'
+
+# 5. Install Salesforce Code Analyzer v5
+- script: |
+    set -e
+    echo "===== Installing Salesforce Code Analyzer ====="
+    sf plugins install @salesforce/plugin-code-analyzer
+    sf plugins --core
+  displayName: 'Install Salesforce Code Analyzer'
+
+# 6. Validate Salesforce Code Analyzer
+- script: |
+    set -e
+    echo "===== Validating Code Analyzer ====="
+    sf code-analyzer --help
+    sf code-analyzer rules --workspace "$(SOURCE_DIRECTORY)"
+  displayName: 'Validate Salesforce Code Analyzer'
+
+# 7. Run Salesforce Security Scan
+- script: |
+    set -e
+
+    echo "=========================================="
+    echo "      SALESFORCE SECURITY SCAN"
+    echo "=========================================="
+
+    sf code-analyzer run \
+      --workspace "$(SOURCE_DIRECTORY)" \
+      --severity-threshold 2
+
+    echo "=========================================="
+    echo "      SECURITY SCAN COMPLETED"
+    echo "=========================================="
+
+  displayName: 'Run Salesforce Security Scan'
+  continueOnError: false
+
 
