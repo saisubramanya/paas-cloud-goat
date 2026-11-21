@@ -1,0 +1,20 @@
+steps:
+  - script: |
+      # 1. Install Salesforce CLI & Code Analyzer v5 plugin
+      npm install -g @salesforce/cli
+      sf plugins install code-analyzer
+
+      # 2. Run scan (Fails build automatically if severity 1 or 2 issues are found)
+      sf code-analyzer run \
+        --workspace . \
+        --rule-selector Recommended \
+        --severity-threshold 2 \
+        --output-file sfca-report.html
+    displayName: 'Run Salesforce Code Analyzer'
+
+  # Optional: Publish the HTML report as a downloadable artifact
+  - task: PublishBuildArtifacts@1
+    condition: always()
+    inputs:
+      PathtoPublish: 'sfca-report.html'
+      ArtifactName: 'CodeAnalyzerReport'
