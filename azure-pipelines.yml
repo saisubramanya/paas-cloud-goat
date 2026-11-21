@@ -1,19 +1,33 @@
-# Starter pipeline
-# Start with a minimal pipeline that you can customize to build and deploy your code.
-# Add steps that build, run tests, deploy, and more:
-# https://aka.ms/yaml
-
 trigger:
-- main
+  - main
+  - develop
 
 pool:
-  vmImage: ubuntu-latest
+  vmImage: 'ubuntu-latest'
 
 steps:
-- script: echo Hello, world!
-  displayName: 'Run a one-line script'
+  - task: NodeTool@0
+    inputs:
+      versionSpec: '18.x'
+    displayName: 'Install Node.js'
 
-- script: |
-    echo Add other tasks to build, test, and deploy your project.
-    echo See https://aka.ms/yaml
-  displayName: 'Run a multi-line script'
+  - script: |
+      npm install -g @salesforce/cli
+    displayName: 'Install Salesforce CLI'
+
+  - script: |
+      sf plugins install @salesforce/sfdx-scanner
+    displayName: 'Install Salesforce Code Analyzer'
+
+  - script: |
+      sf scanner run --target "force-app" --format "junit" --outfile "scanner-results.xml" --severity-threshold 3
+    displayName: 'Run Code Analyzer Scan'
+    continueOnError: true
+
+  - task: PublishTestResults@2
+    inputs:
+      testResultsFormat: 'JUnit'
+      testResultsFiles: 'scanner-results.xml'
+      title: 'Salesforce Code Analyzer Results'
+    displayName: 'Publish Scan Results'
+
